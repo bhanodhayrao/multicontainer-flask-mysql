@@ -152,6 +152,6 @@ Your built images are pushed to:
 
 ## 👨‍💻 Author
 
-**Your Name**
+**Bhanodhay Rao**
 CI/CD Assignment – Multi-Container Web + Database Application
 Technologies: *Python, Flask, MySQL, Docker, Jenkins, GitHub*
