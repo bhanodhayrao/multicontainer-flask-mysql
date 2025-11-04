@@ -43,57 +43,93 @@ pipeline {
         powershell(returnStatus: false, script: '''
           $ErrorActionPreference = "Stop"
 
-          # Build a throwaway network name
-          $ciNet = "ci_net_$env:BUILD_NUMBER"
+          # ----- Config -----
+          $ciNet     = "ci_net_$env:BUILD_NUMBER"
+          $dbName    = "flaskdb"
+          $dbUser    = "flaskuser"
+          $dbPass    = "flaskpass"
+          $hostPort  = 5001
+          $imageTag  = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
+
+          function FailWithLogs($msg) {
+            Write-Host "==== ci_app logs ===="
+            docker logs ci_app 2>$null | Out-String | Write-Host
+            Write-Host "==== ci_db logs ===="
+            docker logs ci_db 2>$null | Out-String | Write-Host
+            throw $msg
+          }
+
           Write-Host "1) Create temp network: $ciNet"
           docker network create $ciNet | Out-Null
 
-          Write-Host "2) Start MySQL sidecar (alias=db)"
-          docker run -d --rm --name ci_db --network $ciNet --network-alias db `
-            -e MYSQL_ROOT_PASSWORD=rootpass123 `
-            -e MYSQL_DATABASE=flaskdb `
-            -e MYSQL_USER=flaskuser `
-            -e MYSQL_PASSWORD=flaskpass `
-            mysql:8.0 | Out-Null
+          try {
+            Write-Host "2) Start MySQL sidecar (alias=db)"
+            docker run -d --rm --name ci_db --network $ciNet --network-alias db `
+              -e MYSQL_ROOT_PASSWORD=rootpass123 `
+              -e MYSQL_DATABASE=$dbName `
+              -e MYSQL_USER=$dbUser `
+              -e MYSQL_PASSWORD=$dbPass `
+              mysql:8.0 | Out-Null
 
-          Write-Host "3) Wait for MySQL to be ready"
-          $dbReady = $false
-          for ($i=1; $i -le 30; $i++) {
-            docker exec ci_db mysqladmin ping -h localhost -uflaskuser -pflaskpass --silent
-            if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $dbReady) {
-            Write-Host "MySQL did not become ready in time. Logs:"
-            docker logs ci_db
-            throw "DB not ready"
-          }
+            Write-Host "3) Wait for MySQL to be ready (mysqladmin ping)"
+            $dbReady = $false
+            for ($i=1; $i -le 60; $i++) {
+              docker exec ci_db mysqladmin ping -h localhost -u$dbUser -p$dbPass --silent
+              if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $dbReady) { FailWithLogs "DB not ready after waiting." }
 
-          # Compose the image tag safely (avoid parsing issues)
-          $imageTag = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
-          Write-Host "4) Run app on same network with image: $imageTag (host port 5001)"
-          docker run -d --rm --name ci_app --network $ciNet -p 5001:5000 `
-            -e DB_HOST=db `
-            -e MYSQL_DATABASE=flaskdb `
-            -e MYSQL_USER=flaskuser `
-            -e MYSQL_PASSWORD=flaskpass `
-            "$imageTag" | Out-Null
+            # Small extra pause – in practice MySQL can still be warming up user/schema
+            Start-Sleep -Seconds 4
 
-          Write-Host "5) Wait for app and hit endpoints"
-          $appReady = $false
-          for ($i=1; $i -le 30; $i++) {
-            curl.exe --fail --silent --show-error "http://localhost:5001/" | Out-Null
-            if ($LASTEXITCODE -eq 0) { $appReady = $true; break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $appReady) {
-            Write-Host "App did not become ready. Logs:"
-            docker logs ci_app
-            throw "App not ready"
-          }
+            Write-Host "4) Run app on same network with image: $imageTag (host port $hostPort)"
+            docker run -d --rm --name ci_app --network $ciNet -p ${hostPort}:5000 `
+              -e DB_HOST=db `
+              -e MYSQL_DATABASE=$dbName `
+              -e MYSQL_USER=$dbUser `
+              -e MYSQL_PASSWORD=$dbPass `
+              "$imageTag" | Out-Null
 
-          curl.exe --fail --silent --show-error "http://localhost:5001/init"  | Out-Null
-          curl.exe --fail --silent --show-error "http://localhost:5001/users" | Out-Null
+            Write-Host "5) Wait for app '/' (HTTP 200)"
+            $appReady = $false
+            for ($i=1; $i -le 60; $i++) {
+              & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/" | Out-Null
+              if ($LASTEXITCODE -eq 0) { $appReady = $true; break }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $appReady) { FailWithLogs "App root (/) never became healthy." }
+
+            Write-Host "6) Hit /init with retries (DB create + insert)"
+            $ok = $false
+            for ($i=1; $i -le 20; $i++) {
+              & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/init" | Out-Null
+              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $ok) { FailWithLogs "/init failed after retries." }
+
+            Write-Host "7) Hit /users with retries (ensure query works)"
+            $ok = $false
+            for ($i=1; $i -le 20; $i++) {
+              $resp = & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/users"
+              if ($LASTEXITCODE -eq 0 -and $resp) { $ok = $true; break }
+              Start-Sleep -Seconds 3
+            }
+            if (-not $ok) { FailWithLogs "/users failed after retries." }
+
+            Write-Host "All integration checks passed ✅"
+          }
+          catch {
+            # Make sure we print logs even if an unexpected error occurs
+            Write-Host "Caught exception in test stage:"
+            Write-Host $_.Exception.Message
+            Write-Host "==== ci_app logs ===="
+            docker logs ci_app 2>$null | Out-String | Write-Host
+            Write-Host "==== ci_db logs ===="
+            docker logs ci_db 2>$null | Out-String | Write-Host
+            throw
+          }
         ''')
       }
       post {
@@ -106,7 +142,6 @@ pipeline {
         }
       }
     }
-
 
 
     stage('Push to Docker Hub') {
