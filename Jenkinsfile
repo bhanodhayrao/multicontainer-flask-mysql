@@ -38,71 +38,72 @@ pipeline {
       }
     }
 
-        stage('Test container') {
+    stage('Test container') {
       steps {
-        bat """
-        @echo on
-        set CI_NET=ci_net_%BUILD_NUMBER%
+        powershell(returnStatus: false, script: '''
+          $ErrorActionPreference = "Stop"
+          $env:CI_NET = "ci_net_$env:BUILD_NUMBER"
 
-        REM 1) Create a temp network
-        docker network create %CI_NET%
+          Write-Host "1) Create temp network: $env:CI_NET"
+          docker network create $env:CI_NET | Out-Null
 
-        REM 2) Start MySQL sidecar on that network with alias 'db'
-        docker run -d --rm --name ci_db --network %CI_NET% --network-alias db ^
-          -e MYSQL_ROOT_PASSWORD=rootpass123 ^
-          -e MYSQL_DATABASE=flaskdb ^
-          -e MYSQL_USER=flaskuser ^
-          -e MYSQL_PASSWORD=flaskpass ^
-          mysql:8.0
+          Write-Host "2) Start MySQL sidecar (alias=db)"
+          docker run -d --rm --name ci_db --network $env:CI_NET --network-alias db `
+            -e MYSQL_ROOT_PASSWORD=rootpass123 `
+            -e MYSQL_DATABASE=flaskdb `
+            -e MYSQL_USER=flaskuser `
+            -e MYSQL_PASSWORD=flaskpass `
+            mysql:8.0 | Out-Null
 
-        REM 3) Wait for MySQL to be ready (up to ~60s)
-        set ok=0
-        for /L %%i in (1,1,30) do (
-          docker exec ci_db mysqladmin ping -h localhost -uflaskuser -pflaskpass --silent >NUL 2>&1 && (set ok=1 & goto :dbready)
-          timeout /t 2 >NUL
-        )
-        :dbready
-        if %ok% NEQ 1 (
-          echo MySQL did not become ready in time. DB logs:
-          docker logs ci_db
-          exit /b 1
-        )
+          Write-Host "3) Wait for MySQL to be ready"
+          $ok = $false
+          for ($i=1; $i -le 30; $i++) {
+            docker exec ci_db mysqladmin ping -h localhost -uflaskuser -pflaskpass --silent
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) {
+            Write-Host "MySQL did not become ready in time. Logs:"
+            docker logs ci_db
+            throw "DB not ready"
+          }
 
-        REM 4) Run the app on same network, mapping host 5001->container 5000 to avoid conflicts
-        docker run -d --rm --name ci_app --network %CI_NET% -p 5001:5000 ^
-          -e DB_HOST=db ^
-          -e MYSQL_DATABASE=flaskdb ^
-          -e MYSQL_USER=flaskuser ^
-          -e MYSQL_PASSWORD=flaskpass ^
-          "%DOCKERHUB_REPO%:commit-%GIT_SHORT%"
+          Write-Host "4) Run app on same network, expose host 5001"
+          docker run -d --rm --name ci_app --network $env:CI_NET -p 5001:5000 `
+            -e DB_HOST=db `
+            -e MYSQL_DATABASE=flaskdb `
+            -e MYSQL_USER=flaskuser `
+            -e MYSQL_PASSWORD=flaskpass `
+            "$env:DOCKERHUB_REPO:commit-$env:GIT_SHORT" | Out-Null
 
-        REM 5) Wait for app to come up and exercise endpoints
-        set ok=0
-        for /L %%i in (1,1,30) do (
-          curl -fsS http://localhost:5001/ >NUL 2>&1 && (set ok=1 & goto :appready)
-          timeout /t 2 >NUL
-        )
-        :appready
-        if %ok% NEQ 1 (
-          echo App did not become ready. Showing logs...
-          docker logs ci_app
-          exit /b 1
-        )
+          Write-Host "5) Wait for app and hit endpoints"
+          $ok = $false
+          for ($i=1; $i -le 30; $i++) {
+            curl -fsS "http://localhost:5001/" | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) {
+            Write-Host "App did not become ready. Logs:"
+            docker logs ci_app
+            throw "App not ready"
+          }
 
-        curl -fsS http://localhost:5001/init >NUL
-        curl -fsS http://localhost:5001/users >NUL
-        """
+          curl -fsS "http://localhost:5001/init"  | Out-Null
+          curl -fsS "http://localhost:5001/users" | Out-Null
+        ''')
       }
       post {
         always {
-          bat """
-          docker rm -f ci_app 2>NUL || exit /b 0
-          docker rm -f ci_db 2>NUL || exit /b 0
-          docker network rm ci_net_%BUILD_NUMBER% 2>NUL || exit /b 0
-          """
+          powershell '''
+            docker rm -f ci_app 2>$null | Out-Null
+            docker rm -f ci_db  2>$null | Out-Null
+            docker network rm "ci_net_$env:BUILD_NUMBER" 2>$null | Out-Null
+          '''
         }
       }
     }
+
 
 
     stage('Push to Docker Hub') {
