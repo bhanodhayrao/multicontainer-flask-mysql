@@ -39,109 +39,123 @@ pipeline {
     }
 
     stage('Test container') {
-      steps {
-        powershell(returnStatus: false, script: '''
-          $ErrorActionPreference = "Stop"
+  steps {
+    powershell(returnStatus: false, script: '''
+      $ErrorActionPreference = "Stop"
 
-          # ----- Config -----
-          $ciNet     = "ci_net_$env:BUILD_NUMBER"
-          $dbName    = "flaskdb"
-          $dbUser    = "flaskuser"
-          $dbPass    = "flaskpass"
-          $hostPort  = 5001
-          $imageTag  = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
+      # ----- Config -----
+      $ciNet     = "ci_net_$env:BUILD_NUMBER"
+      $dbName    = "flaskdb"
+      $dbUser    = "flaskuser"
+      $dbPass    = "flaskpass"
+      $hostPort  = 5001
+      $imageTag  = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
 
-          function FailWithLogs($msg) {
-            Write-Host "==== ci_app logs ===="
-            docker logs ci_app 2>$null | Out-String | Write-Host
-            Write-Host "==== ci_db logs ===="
-            docker logs ci_db 2>$null | Out-String | Write-Host
-            throw $msg
-          }
-
-          Write-Host "1) Create temp network: $ciNet"
-          docker network create $ciNet | Out-Null
-
-          try {
-            Write-Host "2) Start MySQL sidecar (alias=db)"
-            docker run -d --rm --name ci_db --network $ciNet --network-alias db `
-              -e MYSQL_ROOT_PASSWORD=rootpass123 `
-              -e MYSQL_DATABASE=$dbName `
-              -e MYSQL_USER=$dbUser `
-              -e MYSQL_PASSWORD=$dbPass `
-              mysql:8.0 | Out-Null
-
-            Write-Host "3) Wait for MySQL to be ready (mysqladmin ping)"
-            $dbReady = $false
-            for ($i=1; $i -le 60; $i++) {
-              docker exec ci_db mysqladmin ping -h localhost -u$dbUser -p$dbPass --silent
-              if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
-              Start-Sleep -Seconds 2
-            }
-            if (-not $dbReady) { FailWithLogs "DB not ready after waiting." }
-
-            # Small extra pause – in practice MySQL can still be warming up user/schema
-            Start-Sleep -Seconds 4
-
-            Write-Host "4) Run app on same network with image: $imageTag (host port $hostPort)"
-            docker run -d --rm --name ci_app --network $ciNet -p ${hostPort}:5000 `
-              -e DB_HOST=db `
-              -e MYSQL_DATABASE=$dbName `
-              -e MYSQL_USER=$dbUser `
-              -e MYSQL_PASSWORD=$dbPass `
-              "$imageTag" | Out-Null
-
-            Write-Host "5) Wait for app '/' (HTTP 200)"
-            $appReady = $false
-            for ($i=1; $i -le 60; $i++) {
-              & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/" | Out-Null
-              if ($LASTEXITCODE -eq 0) { $appReady = $true; break }
-              Start-Sleep -Seconds 2
-            }
-            if (-not $appReady) { FailWithLogs "App root (/) never became healthy." }
-
-            Write-Host "6) Hit /init with retries (DB create + insert)"
-            $ok = $false
-            for ($i=1; $i -le 20; $i++) {
-              & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/init" | Out-Null
-              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-              Start-Sleep -Seconds 3
-            }
-            if (-not $ok) { FailWithLogs "/init failed after retries." }
-
-            Write-Host "7) Hit /users with retries (ensure query works)"
-            $ok = $false
-            for ($i=1; $i -le 20; $i++) {
-              $resp = & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/users"
-              if ($LASTEXITCODE -eq 0 -and $resp) { $ok = $true; break }
-              Start-Sleep -Seconds 3
-            }
-            if (-not $ok) { FailWithLogs "/users failed after retries." }
-
-            Write-Host "All integration checks passed ✅"
-          }
-          catch {
-            # Make sure we print logs even if an unexpected error occurs
-            Write-Host "Caught exception in test stage:"
-            Write-Host $_.Exception.Message
-            Write-Host "==== ci_app logs ===="
-            docker logs ci_app 2>$null | Out-String | Write-Host
-            Write-Host "==== ci_db logs ===="
-            docker logs ci_db 2>$null | Out-String | Write-Host
-            throw
-          }
-        ''')
+      function DumpLogs {
+        Write-Host "==== ci_app logs ===="
+        docker logs ci_app 2>$null | Out-String | Write-Host
+        Write-Host "==== ci_db logs ===="
+        docker logs ci_db 2>$null | Out-String | Write-Host
       }
-      post {
-        always {
-          powershell '''
-            docker rm -f ci_app 2>$null | Out-Null
-            docker rm -f ci_db  2>$null | Out-Null
-            docker network rm "ci_net_$env:BUILD_NUMBER" 2>$null | Out-Null
-          '''
+
+      function FailWithLogs($msg) {
+        DumpLogs
+        throw $msg
+      }
+
+      Write-Host "1) Create temp network: $ciNet"
+      docker network create $ciNet | Out-Null
+
+      try {
+        Write-Host "2) Start MySQL sidecar (alias=db)"
+        docker run -d --rm --name ci_db --network $ciNet --network-alias db `
+          -e MYSQL_ROOT_PASSWORD=rootpass123 `
+          -e MYSQL_DATABASE=$dbName `
+          -e MYSQL_USER=$dbUser `
+          -e MYSQL_PASSWORD=$dbPass `
+          mysql:8.0 | Out-Null
+
+        Write-Host "3) Wait for MySQL to be ready (mysqladmin ping)"
+        $dbReady = $false
+        for ($i=1; $i -le 90; $i++) {
+          docker exec ci_db mysqladmin ping -h localhost -u$dbUser -p$dbPass --silent
+          if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
+          Start-Sleep -Seconds 2
         }
+        if (-not $dbReady) { FailWithLogs "DB not ready after waiting." }
+
+        Write-Host "3b) Verify SQL auth & schema with SELECT 1"
+        $sqlOK = $false
+        for ($i=1; $i -le 30; $i++) {
+          docker exec ci_db sh -lc "mysql -u$dbUser -p$dbPass -D $dbName -e \"SELECT 1;\""  | Out-Null
+          if ($LASTEXITCODE -eq 0) { $sqlOK = $true; break }
+          Start-Sleep -Seconds 2
+        }
+        if (-not $sqlOK) { FailWithLogs "DB auth/schema check failed for $dbUser@$dbName." }
+
+        # Small extra cushion
+        Start-Sleep -Seconds 4
+
+        Write-Host "4) Run app on same network with image: $imageTag (host port $hostPort)"
+        docker run -d --rm --name ci_app --network $ciNet -p ${hostPort}:5000 `
+          -e DB_HOST=db `
+          -e MYSQL_DATABASE=$dbName `
+          -e MYSQL_USER=$dbUser `
+          -e MYSQL_PASSWORD=$dbPass `
+          "$imageTag" | Out-Null
+
+        Write-Host "5) Wait for app root '/' to return 200"
+        $appReady = $false
+        for ($i=1; $i -le 60; $i++) {
+          & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/" | Out-Null
+          if ($LASTEXITCODE -eq 0) { $appReady = $true; break }
+          Start-Sleep -Seconds 2
+        }
+        if (-not $appReady) { FailWithLogs "App root (/) never became healthy." }
+
+        # Extra cushion before DB-using endpoints
+        Start-Sleep -Seconds 5
+
+        Write-Host "6) Hit /init with retries (DB create + insert)"
+        $ok = $false
+        for ($i=1; $i -le 30; $i++) {
+          & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/init" | Out-Null
+          if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+          Start-Sleep -Seconds 3
+        }
+        if (-not $ok) { FailWithLogs "/init failed after retries." }
+
+        Write-Host "7) Hit /users with retries (ensure query works)"
+        $ok = $false
+        $resp = ""
+        for ($i=1; $i -le 30; $i++) {
+          $resp = & curl.exe --fail --silent --show-error "http://localhost:${hostPort}/users"
+          if ($LASTEXITCODE -eq 0 -and $resp) { $ok = $true; break }
+          Start-Sleep -Seconds 3
+        }
+        if (-not $ok) { FailWithLogs "/users failed after retries." }
+
+        Write-Host "Users response: $resp"
+        Write-Host "All integration checks passed ✅"
       }
+      catch {
+        Write-Host "Caught exception in test stage:"
+        Write-Host $_.Exception.Message
+        DumpLogs
+        throw
+      }
+    ''')
+  }
+  post {
+    always {
+      powershell '''
+        docker rm -f ci_app 2>$null | Out-Null
+        docker rm -f ci_db  2>$null | Out-Null
+        docker network rm "ci_net_$env:BUILD_NUMBER" 2>$null | Out-Null
+      '''
     }
+  }
+}
 
 
     stage('Push to Docker Hub') {
