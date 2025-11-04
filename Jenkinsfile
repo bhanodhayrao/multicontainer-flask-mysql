@@ -42,13 +42,14 @@ pipeline {
       steps {
         powershell(returnStatus: false, script: '''
           $ErrorActionPreference = "Stop"
-          $env:CI_NET = "ci_net_$env:BUILD_NUMBER"
 
-          Write-Host "1) Create temp network: $env:CI_NET"
-          docker network create $env:CI_NET | Out-Null
+          # Build a throwaway network name
+          $ciNet = "ci_net_$env:BUILD_NUMBER"
+          Write-Host "1) Create temp network: $ciNet"
+          docker network create $ciNet | Out-Null
 
           Write-Host "2) Start MySQL sidecar (alias=db)"
-          docker run -d --rm --name ci_db --network $env:CI_NET --network-alias db `
+          docker run -d --rm --name ci_db --network $ciNet --network-alias db `
             -e MYSQL_ROOT_PASSWORD=rootpass123 `
             -e MYSQL_DATABASE=flaskdb `
             -e MYSQL_USER=flaskuser `
@@ -56,41 +57,43 @@ pipeline {
             mysql:8.0 | Out-Null
 
           Write-Host "3) Wait for MySQL to be ready"
-          $ok = $false
+          $dbReady = $false
           for ($i=1; $i -le 30; $i++) {
             docker exec ci_db mysqladmin ping -h localhost -uflaskuser -pflaskpass --silent
-            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
             Start-Sleep -Seconds 2
           }
-          if (-not $ok) {
+          if (-not $dbReady) {
             Write-Host "MySQL did not become ready in time. Logs:"
             docker logs ci_db
             throw "DB not ready"
           }
 
-          Write-Host "4) Run app on same network, expose host 5001"
-          docker run -d --rm --name ci_app --network $env:CI_NET -p 5001:5000 `
+          # Compose the image tag safely (avoid parsing issues)
+          $imageTag = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
+          Write-Host "4) Run app on same network with image: $imageTag (host port 5001)"
+          docker run -d --rm --name ci_app --network $ciNet -p 5001:5000 `
             -e DB_HOST=db `
             -e MYSQL_DATABASE=flaskdb `
             -e MYSQL_USER=flaskuser `
             -e MYSQL_PASSWORD=flaskpass `
-            "$env:DOCKERHUB_REPO:commit-$env:GIT_SHORT" | Out-Null
+            "$imageTag" | Out-Null
 
           Write-Host "5) Wait for app and hit endpoints"
-          $ok = $false
+          $appReady = $false
           for ($i=1; $i -le 30; $i++) {
-            curl -fsS "http://localhost:5001/" | Out-Null
-            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            curl.exe --fail --silent --show-error "http://localhost:5001/" | Out-Null
+            if ($LASTEXITCODE -eq 0) { $appReady = $true; break }
             Start-Sleep -Seconds 2
           }
-          if (-not $ok) {
+          if (-not $appReady) {
             Write-Host "App did not become ready. Logs:"
             docker logs ci_app
             throw "App not ready"
           }
 
-          curl -fsS "http://localhost:5001/init"  | Out-Null
-          curl -fsS "http://localhost:5001/users" | Out-Null
+          curl.exe --fail --silent --show-error "http://localhost:5001/init"  | Out-Null
+          curl.exe --fail --silent --show-error "http://localhost:5001/users" | Out-Null
         ''')
       }
       post {
