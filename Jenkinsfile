@@ -51,11 +51,24 @@ pipeline {
       $hostPort  = 5001
       $imageTag  = "$($env:DOCKERHUB_REPO):commit-$($env:GIT_SHORT)"
 
+      function ContainerExists($name) {
+        $id = (docker ps -a -q -f "name=$name").Trim()
+        return -not [string]::IsNullOrEmpty($id)
+      }
+
       function DumpLogs {
         Write-Host "==== ci_app logs ===="
-        docker logs ci_app 2>$null | Out-String | Write-Host
+        if (ContainerExists "ci_app") {
+          docker logs ci_app 2>$null | Out-String | Write-Host
+        } else {
+          Write-Host "(no ci_app container)"
+        }
         Write-Host "==== ci_db logs ===="
-        docker logs ci_db 2>$null | Out-String | Write-Host
+        if (ContainerExists "ci_db") {
+          docker logs ci_db 2>$null | Out-String | Write-Host
+        } else {
+          Write-Host "(no ci_db container)"
+        }
       }
 
       function FailWithLogs($msg) {
@@ -78,16 +91,17 @@ pipeline {
         Write-Host "3) Wait for MySQL to be ready (mysqladmin ping)"
         $dbReady = $false
         for ($i=1; $i -le 90; $i++) {
-          docker exec ci_db mysqladmin ping -h localhost -u$dbUser -p$dbPass --silent
+          docker exec ci_db mysqladmin ping -h 127.0.0.1 -u$dbUser -p$dbPass --silent
           if ($LASTEXITCODE -eq 0) { $dbReady = $true; break }
           Start-Sleep -Seconds 2
         }
         if (-not $dbReady) { FailWithLogs "DB not ready after waiting." }
 
-        Write-Host "3b) Verify SQL auth & schema with SELECT 1"
+        Write-Host "3b) Verify SQL auth & schema with SELECT 1 (arg-array to avoid quoting issues)"
+        $args = @("mysql", "-h", "127.0.0.1", "-u$dbUser", "-p$dbPass", "-D", "$dbName", "-e", "SELECT 1;")
         $sqlOK = $false
         for ($i=1; $i -le 30; $i++) {
-          docker exec ci_db sh -lc "mysql -u$dbUser -p$dbPass -D $dbName -e \"SELECT 1;\""  | Out-Null
+          docker exec ci_db @args | Out-Null
           if ($LASTEXITCODE -eq 0) { $sqlOK = $true; break }
           Start-Sleep -Seconds 2
         }
@@ -103,6 +117,11 @@ pipeline {
           -e MYSQL_USER=$dbUser `
           -e MYSQL_PASSWORD=$dbPass `
           "$imageTag" | Out-Null
+
+        # Sanity: confirm app container exists
+        if (-not (ContainerExists "ci_app")) {
+          FailWithLogs "App container did not start."
+        }
 
         Write-Host "5) Wait for app root '/' to return 200"
         $appReady = $false
